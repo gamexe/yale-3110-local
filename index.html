@@ -954,6 +954,16 @@
     </div>
   </div>
 
+  <div class="card" style="margin-top: 14px;">
+    <div id="bluetooth-status" role="status">Bluetooth: restoring saved lock…</div>
+    <label style="display:block; margin-top:12px;"><input type="checkbox" id="auto-reconnect" checked onchange="setAutoReconnect(this.checked)"> Reconnect automatically while this page is visible</label>
+    <label style="display:block; margin-top:12px;"><input type="checkbox" id="auto-unlock-on-open" onchange="setUnlockOnOpen(this.checked)"> Unlock automatically when this page opens (once per opening)</label>
+    <button class="save-btn" id="arm-unlock" onclick="armAutoUnlock()">Unlock on next connection</button>
+    <button class="save-btn" onclick="cancelAutoUnlock()">Cancel automatic unlock</button>
+    <div class="sub-status" id="auto-unlock-status">Automatic unlock is off.</div>
+    <p class="sub-status">Keep Bluefy open in the foreground. A saved device ID needs browser Bluetooth permission; it cannot restore permission itself. This page cannot detect arrival or run reliably with the phone locked.</p>
+  </div>
+
   <div class="log-box" id="log-box">
     [System] Bluefy Web Bluetooth Engine Ready.<br/>
   </div>
@@ -995,7 +1005,9 @@
     function log(msg) {
       const box = document.getElementById("log-box");
       const time = new Date().toLocaleTimeString();
-      box.innerHTML += `[${time}] ${msg}<br/>`;
+      const line = document.createElement("div");
+      line.textContent = `[${time}] ${msg}`;
+      box.appendChild(line);
       box.scrollTop = box.scrollHeight;
     }
 
@@ -1213,6 +1225,14 @@
     }
 
     function clearCredentials() {
+      cancelAutoUnlock();
+      setAutoReconnect(false);
+      if (cachedDevice?.gatt?.connected) cachedDevice.gatt.disconnect();
+      cachedDevice = null;
+      sessionStorage.removeItem("yale_device_id");
+      localStorage.removeItem("yale_device_id");
+      localStorage.removeItem('yale_unlock_on_open');
+      document.getElementById('auto-unlock-on-open').checked = false;
       localStorage.removeItem("yale_client_mac");
       localStorage.removeItem("yale_module_mac");
       localStorage.removeItem("yale_skr");
@@ -1228,51 +1248,155 @@
       if (localStorage.getItem("yale_skr")) document.getElementById("inp-skr").value = localStorage.getItem("yale_skr");
     }
     let cachedDevice = null;
+    let unlockBusy = false;
+    let reconnectBusy = false;
+    let reconnectTimer = null;
+    let reconnectDelay = 1000;
+    let connectionGeneration = 0;
+    let autoReconnect = localStorage.getItem('yale_auto_reconnect') !== 'false';
+    let autoUnlockArmed = false;
 
-    async function getOrSelectDevice(forcePicker = false) {
-      if (!forcePicker && cachedDevice && cachedDevice.gatt) {
-        log(`Reusing connected device: ${cachedDevice.name || 'Yale Lock'}`);
-        return cachedDevice;
+    function bluetoothStatus(message) {
+      document.getElementById('bluetooth-status').textContent = 'Bluetooth: ' + message;
+    }
+
+    function rememberDevice(device) {
+      if (cachedDevice !== device) {
+        connectionGeneration++;
+        if (cachedDevice) cachedDevice.removeEventListener('gattserverdisconnected', onDeviceDisconnected);
+        cachedDevice = device;
+        device.addEventListener('gattserverdisconnected', onDeviceDisconnected);
       }
-
-      if (!forcePicker && navigator.bluetooth.getDevices) {
-        try {
-          const devices = await navigator.bluetooth.getDevices();
-          if (devices && devices.length > 0) {
-            const found = devices.find(d => d.name && (d.name.includes("iRe") || d.name.includes("Yale"))) || devices[0];
-            if (found) {
-              log(`Auto-selected paired device: ${found.name || found.id}`);
-              cachedDevice = found;
-              return found;
-            }
-          }
-        } catch (e) {
-          log("getDevices lookup: " + e);
-        }
-      }
-
-      let device = null;
-      try {
-        device = await navigator.bluetooth.requestDevice({
-          filters: [
-            { namePrefix: 'iRe' },
-            { namePrefix: 'Yale' }
-          ],
-          optionalServices: ALL_OPTIONAL_SERVICES
-        });
-      } catch (filterErr) {
-        log("Filtered scan fallback: " + (filterErr.message || filterErr));
-        device = await navigator.bluetooth.requestDevice({
-          acceptAllDevices: true,
-          optionalServices: ALL_OPTIONAL_SERVICES
-        });
-      }
-
-      if (device) cachedDevice = device;
+      // Store identity only. BluetoothDevice objects and GATT sessions cannot be serialized.
+      sessionStorage.setItem('yale_device_id', device.id);
+      localStorage.setItem('yale_device_id', device.id);
       return device;
     }
 
-    async function executeUnlock(forcePicker = false) {
+    function onDeviceDisconnected() {
+      bluetoothStatus('disconnected — waiting for saved lock');
+      scheduleReconnect();
+    }
+
+    async function restoreDevice() {
+      if (cachedDevice) return cachedDevice;
+      const savedId = sessionStorage.getItem('yale_device_id') || localStorage.getItem('yale_device_id');
+      if (!savedId) { bluetoothStatus('tap Unlock once to select your lock'); return null; }
+      if (typeof navigator.bluetooth?.getDevices !== 'function') {
+        bluetoothStatus('this browser requires a tap to restore the saved lock');
+        return null;
+      }
+      const devices = await navigator.bluetooth.getDevices();
+      // Never substitute the first granted peripheral for the user's saved lock.
+      const device = devices.find(d => d.id === savedId);
+      if (!device) { bluetoothStatus('saved lock permission unavailable — tap Unlock to select it'); return null; }
+      return rememberDevice(device);
+    }
+
+    async function getOrSelectDevice(forcePicker = false, allowPicker = true) {
+      if (!forcePicker) {
+        const restored = await restoreDevice();
+        if (restored) return restored;
+      }
+      if (!allowPicker) return null;
+      // Only an explicit user action may display the device picker.
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'iRe' }, { namePrefix: 'Yale' }],
+        optionalServices: ALL_OPTIONAL_SERVICES
+      });
+      return rememberDevice(device);
+    }
+
+    function scheduleReconnect() {
+      clearTimeout(reconnectTimer);
+      if (!autoReconnect || document.hidden || unlockBusy || reconnectBusy) return;
+      reconnectTimer = setTimeout(reconnectSavedDevice, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    }
+
+    async function reconnectSavedDevice() {
+      if (!navigator.bluetooth || !autoReconnect || document.hidden || unlockBusy || reconnectBusy) return;
+      reconnectBusy = true;
+      try {
+        const device = await getOrSelectDevice(false, false);
+        if (!device) return;
+        const generation = connectionGeneration;
+        if (!device.gatt.connected) {
+          bluetoothStatus('connecting to saved lock…');
+          await device.gatt.connect();
+        }
+        if (generation !== connectionGeneration || !autoReconnect || document.hidden) {
+          device.gatt.disconnect();
+          return;
+        }
+        reconnectDelay = 1000;
+        bluetoothStatus('connected to ' + (device.name || 'saved lock'));
+        if (autoUnlockArmed) {
+          // Consume before any command: never retry an uncertain unlock automatically.
+          const lastAttempt = Number(localStorage.getItem('yale_last_auto_attempt') || 0);
+          if (Date.now() - lastAttempt < 60000) {
+            cancelAutoUnlock('Automatic unlock skipped: an attempt was made within the last minute. Tap Unlock if needed.');
+            return;
+          }
+          localStorage.setItem('yale_last_auto_attempt', String(Date.now()));
+          cancelAutoUnlock('Automatic unlock attempted. Tap to arm another attempt.');
+          reconnectBusy = false;
+          await executeUnlock(false, true);
+        }
+      } catch (error) {
+        bluetoothStatus('waiting for saved lock — retrying');
+        log('Reconnect: ' + (error.message || error));
+      } finally {
+        reconnectBusy = false;
+        if (cachedDevice && !cachedDevice.gatt.connected) scheduleReconnect();
+      }
+    }
+
+    function setAutoReconnect(enabled) {
+      autoReconnect = enabled;
+      localStorage.setItem('yale_auto_reconnect', String(enabled));
+      document.getElementById('auto-reconnect').checked = enabled;
+      clearTimeout(reconnectTimer);
+      if (enabled) reconnectSavedDevice();
+      else {
+        cancelAutoUnlock();
+        bluetoothStatus('automatic reconnect paused');
+      }
+    }
+
+    function cancelAutoUnlock(message = 'Automatic unlock is off.') {
+      autoUnlockArmed = false;
+      document.getElementById('auto-unlock-status').textContent = message;
+    }
+
+    function setUnlockOnOpen(enabled) {
+      localStorage.setItem('yale_unlock_on_open', String(enabled));
+      if (enabled) armAutoUnlock();
+      else cancelAutoUnlock();
+    }
+
+    function armAutoUnlock() {
+      if (unlockBusy) return;
+      if (!navigator.bluetooth || !cachedDevice) {
+        bluetoothStatus('tap Unlock once to select your lock before arming');
+        return;
+      }
+      autoUnlockArmed = true;
+      document.getElementById('auto-unlock-status').textContent = 'Armed once: unlock when the saved lock connects. Reloading cancels this.';
+      setAutoReconnect(true);
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) clearTimeout(reconnectTimer);
+      else if (autoReconnect) reconnectSavedDevice();
+    });
+    window.addEventListener('pageshow', () => {
+      if (autoReconnect) reconnectSavedDevice();
+    });
+
+    async function executeUnlock(forcePicker = false, automatic = false) {
+      if (unlockBusy || reconnectBusy) return;
+      cancelAutoUnlock();
       const btn = document.getElementById("unlock-btn");
       const statusMain = document.getElementById("status-main");
       const statusSub = document.getElementById("status-sub");
@@ -1282,21 +1406,26 @@
         return;
       }
 
+      unlockBusy = true;
+      clearTimeout(reconnectTimer);
+      let activeDevice = null;
+      let activeChar = null;
+      let notificationHandler = null;
       btn.classList.add("running");
       statusMain.innerText = "Connecting to Lock...";
       statusSub.innerText = "Reconnecting directly to lock...";
 
+      try {
       const clientMac = document.getElementById("inp-client-mac").value.replace(/:/g, "").toLowerCase();
       const skrHex = document.getElementById("inp-skr").value.replace(/[^0-9a-fA-F]/g, "");
       if (!/^[0-9a-f]{12}$/.test(clientMac) || !/^[0-9a-fA-F]{64}$/.test(skrHex)) {
-        alert("Enter the 12-hex client identifier and 64-hex SKr in Stored Credentials first.");
-        return;
+        throw new Error("Enter the 12-hex client identifier and 64-hex SKr in Stored Credentials first.");
       }
       const skr = hexToBytes(skrHex);
       const ekr = await deriveEncryptionKey(skr);
 
-      try {
-        const device = await getOrSelectDevice(forcePicker);
+        const device = await getOrSelectDevice(forcePicker, !automatic);
+        activeDevice = device;
         if (!device) throw new Error("No device selected");
 
         log(`Found device: ${device.name || 'Yale Lock'} (${device.id})`);
@@ -1324,15 +1453,17 @@
         let rxQueue = [];
         let rxResolver = null;
 
-        await char.startNotifications();
-        char.addEventListener('characteristicvaluechanged', (event) => {
+        activeChar = char;
+        notificationHandler = (event) => {
           const val = new Uint8Array(event.target.value.buffer);
           if (rxResolver) {
             const res = rxResolver; rxResolver = null; res(val);
           } else {
             rxQueue.push(val);
           }
-        });
+        };
+        char.addEventListener('characteristicvaluechanged', notificationHandler);
+        await char.startNotifications();
 
         async function receiveFrame(timeoutMs = 5000) {
           if (rxQueue.length > 0) return rxQueue.shift();
@@ -1450,12 +1581,25 @@
         statusMain.innerText = "Unlock Failed";
         statusSub.innerText = errMsg;
       } finally {
+        if (activeChar && notificationHandler) activeChar.removeEventListener('characteristicvaluechanged', notificationHandler);
+        if (activeDevice?.gatt?.connected) activeDevice.gatt.disconnect();
+        unlockBusy = false;
         btn.classList.remove("running");
+        scheduleReconnect();
       }
     }
 
     window.addEventListener('load', async () => {
       loadCredentials();
+      const unlockOnOpen = localStorage.getItem('yale_unlock_on_open') === 'true';
+      document.getElementById('auto-unlock-on-open').checked = unlockOnOpen;
+      if (unlockOnOpen) {
+        autoUnlockArmed = true;
+        document.getElementById('auto-unlock-status').textContent = 'Waiting for saved lock: one automatic unlock this opening. Cancel below to stop.';
+      }
+      document.getElementById('auto-reconnect').checked = autoReconnect;
+      if (!navigator.bluetooth) bluetoothStatus('unavailable — open this page in Bluefy');
+      else if (autoReconnect) reconnectSavedDevice();
       const badge = document.getElementById('cache-badge');
       let cached = false;
 
@@ -1473,7 +1617,7 @@
       // 2. Direct CacheStorage
       if ('caches' in window) {
         try {
-          const cache = await caches.open('yale-lock-offline-v1');
+          const cache = await caches.open('yale-lock-offline-v3');
           await cache.add(window.location.href);
           log("[Cache] Stored in local CacheStorage.");
           cached = true;
@@ -1496,10 +1640,18 @@
 
       const params = new URLSearchParams(window.location.search);
       if (params.has('auto') || params.has('autounlock')) {
-        log("Auto-unlock parameter detected (?auto=1). Starting unlock...");
-        setTimeout(() => executeUnlock(false), 400);
+        // Consume a URL request once per tab. Refresh must not repeat an unlock.
+        const requestKey = 'yale_auto_url_consumed';
+        if (!sessionStorage.getItem(requestKey)) {
+          sessionStorage.setItem(requestKey, '1');
+          try {
+            await restoreDevice();
+            armAutoUnlock();
+          } catch (error) { log('Auto-unlock restore: ' + (error.message || error)); }
+        }
       }
     });
   </script>
 </body>
 </html>
+

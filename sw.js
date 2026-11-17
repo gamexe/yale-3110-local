@@ -1,5 +1,5 @@
 // sw.js - Yale Smart Lock Offline Service Worker
-const CACHE_NAME = "yale-lock-offline-v2";
+const CACHE_NAME = "yale-lock-offline-v3";
 const ASSETS_TO_CACHE = [
   "./",
   "./?auto=1",
@@ -22,7 +22,7 @@ self.addEventListener("activate", (event) => {
     caches.keys().then((keys) => {
       return Promise.all(
         keys.map((key) => {
-          if (key !== CACHE_NAME) {
+          if (key.startsWith("yale-lock-offline-") && key !== CACHE_NAME) {
             console.log("[ServiceWorker] Removing old cache:", key);
             return caches.delete(key);
           }
@@ -58,3 +58,4 @@ self.addEventListener("fetch", (event) => {
     })
   );
 });
+
